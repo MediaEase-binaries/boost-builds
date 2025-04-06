@@ -1,0 +1,296 @@
+name: Build Boost
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Boost version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '1.69.0'
+          - '1.70.0'
+          - '1.71.0'
+          - '1.72.0'
+          - '1.73.0'
+          - '1.74.0'
+          - '1.75.0'
+          - '1.76.0'
+          - '1.77.0'
+          - '1.78.0'
+          - '1.79.0'
+          - '1.80.0'
+          - '1.81.0'
+          - '1.82.0'
+          - '1.83.0'
+          - '1.84.0'
+          - '1.85.0'
+          - '1.86.0'
+          - '1.87.0'
+          - '1.88.0_rc1'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: generate
+        run: |
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          cat matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.boost_version }} (${{ matrix.os }})
+    needs: setup-matrix
+    strategy:
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'latest' || matrix.os == 'ubuntu-18.04' && '18.04' || matrix.os == 'ubuntu-20.04' && '20.04' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
+
+    steps:
+      - name: Debug context
+        run: |
+          echo "Matrix context:"
+          echo "${{ toJson(matrix) }}"
+          echo "OS: ${{ matrix.os }}"
+          echo "Version: ${{ matrix.boost_version }}"
+
+      - name: Bootstrap container (update + deps)
+        run: |
+          apt-get update
+          apt-get upgrade -y
+          apt-get install -y --no-install-recommends \
+            apt-transport-https rsync lsb-release curl wget imagemagick git gzip util-linux dnsutils dirmngr acl iptables-persistent software-properties-common psmisc gnupg2 ca-certificates gpg-agent iproute2 dos2unix nfs-common jq sudo locales debconf-utils net-tools build-essential bc automake make cmake checkinstall libnss3-tools nano zip unzip htop vnstat vnstati vsftpd subversion ssl-cert openssl libfcgi0ldbl libsqlite3-dev sqlite3 libtool libcppunit-dev libssl-dev fontconfig libfontconfig1 libfontconfig1-dev zlib1g-dev libbz2-dev libreadline-dev libcairo2-dev libcurl4-openssl-dev libgirepository1.0-dev llvm libncurses5-dev libncursesw5-dev xz-utils tk-dev liblzma-dev python3 python3-apt python3-software-properties python3-wheel python3-psutil python3-pip python3-dev python3-all-dev python3-docopt python3-setuptools python3-venv expect nftables autoconf-archive debian-keyring debian-archive-keyring libicu-dev
+
+      - name: Pre-check
+        id: pre-check
+        run: |
+          EXPECTED_DEB="libboost-all-dev_${{ matrix.boost_version }}_${{ matrix.os }}.deb"
+          if gh release view "v${{ matrix.boost_version }}" 2>/dev/null | grep -q "$EXPECTED_DEB"; then
+            echo "Asset $EXPECTED_DEB already exists in release v${{ matrix.boost_version }}, skipping"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "Asset $EXPECTED_DEB needs to be built"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "codename=$(lsb_release -cs)" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Checkout repository
+        if: steps.pre-check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        if: steps.pre-check.outputs.should_build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Setup common scripts
+        if: steps.pre-check.outputs.should_build == 'true'
+        id: setup
+        run: |
+          chmod +x tools/*.sh
+          echo "build_script=tools/packages/boost/build.sh" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+
+      - name: Build Boost
+        if: steps.pre-check.outputs.should_build == 'true'
+        run: |
+          chmod +x ${{ steps.setup.outputs.build_script }}
+          COMMITTER_NAME="${{ secrets.COMMITTER_NAME }}" COMMITTER_EMAIL="${{ secrets.COMMITTER_EMAIL }}" ./${{ steps.setup.outputs.build_script }} ${{ matrix.boost_version }}
+
+      - name: Generate metadata
+        if: steps.pre-check.outputs.should_build == 'true'
+        run: |
+          mkdir -p artifacts
+          deb_file=$(find . -name "libboost-all-dev_${{ matrix.boost_version }}*" | head -n1)
+          echo "DEB trouvé : $deb_file"
+          base=$(basename "$deb_file" .deb)
+          echo "Codename: ${{ steps.pre-check.outputs.codename }}"
+          distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          os=$distro-${{ steps.pre-check.outputs.codename }}
+          base=${base%_amd64}
+          full_name="${base}_${os}_amd64.deb"
+          echo "Full name: $full_name"
+          mv "$deb_file"  "artifacts/${full_name}"
+          echo "Generating metadata for $deb_file"
+          cd artifacts
+          ../${{ steps.setup.outputs.metadata_script }} \
+            --category "boost" \
+            --tag      "${{ matrix.stability }}" \
+            --version  "${{ matrix.boost_version }}" \
+            --os       "${{ steps.pre-check.outputs.codename }}" \
+            "$full_name" \
+          ls -la artifacts/
+
+      - name: Upload as Artifact
+        if: steps.pre-check.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: boost-${{ matrix.boost_version }}_${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 7
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['1.69.0', '1.70.0', '1.71.0', '1.72.0', '1.73.0', '1.74.0', '1.75.0', '1.76.0', '1.77.0', '1.78.0', '1.79.0', '1.80.0', '1.81.0', '1.82.0', '1.83.0', '1.84.0', '1.85.0', '1.86.0', '1.87.0', '1.88.0_rc1']
+      fail-fast: false
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: boost-${{ matrix.version }}*
+      
+      - name: Prepare release assets
+        id: prepare-release-assets
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "libboost-all-dev_${{ matrix.version }}*.deb" -o \
+              -name "libboost-all-dev_${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          {
+            echo "| Package | OS |"
+            echo "| ---     | ---|"
+            for f in release_assets/*.deb; do
+              name=$(basename "$f")
+              os=$(echo "$name" | sed -E 's/.*_(ubuntu|debian)-([^_]+).*\.deb$/\1 \2/' | awk '{print toupper(substr($1,1,1))substr($1,2)" "toupper(substr($2,1,1))substr($2,2)}')
+              echo "| $name | $os |"
+            done
+          } > "$PACKAGES_TABLE"
+          {
+            echo "| Feature | Configuration |"
+            echo "| ---     | ---           |"
+            echo "| Threading Support | Multi-threaded ✓ |"
+            echo "| C++ Standard | C++17 |"
+            echo "| Compiler Flags | -std=c++17 -fPIC |"
+            echo "| Link Type | Static + Shared |"
+            echo "| Runtime Link | Shared |"
+            echo "| Libraries | System, Python |"
+            echo "| Layout | System |"
+          } > "$CONFIG_TABLE"
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          count=$(ls release_assets/*.deb 2>/dev/null | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip_release=false" >> $GITHUB_OUTPUT
+          fi
+          echo "Files prepared for release:"
+          ls -la release_assets/
+          rm -rf "$TEMP_DIR"
+      
+      - name: Create Release
+        if: steps.prepare-release-assets.outputs.skip_release == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: Boost ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            # Boost C++ Libraries v${{ matrix.version }}
+
+            Pre-built Boost C++ Libraries packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled binaries ready to use
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+            - Both static and shared libraries included
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare-release-assets.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare-release-assets.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 🔍 Package Details
+
+            - Each package includes:
+              - Development headers
+              - Static libraries (.a)
+              - Shared libraries (.so)
+              - Python bindings
+              - CMake configuration files
+
+            - The packages are built with:
+              - Full C++17 support
+              - Position Independent Code (-fPIC)
+              - Multi-threading support
+              - System-wide installation
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            Boost is distributed under the [Boost Software License](https://www.boost.org/LICENSE_1_0.txt).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
